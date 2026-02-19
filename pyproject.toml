@@ -14,3 +14,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.4"]
 transcribe = ["faster-whisper>=1.0"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
