@@ -98,9 +98,16 @@ async def fetch_clips(
         thumb = c.get("thumbnail_url", "")
         # thumbnail format: https://clips-media-assets2.twitch.tv/xxx-preview-480x272.jpg
         # video URL: everything before -preview + .mp4
+        # Extract download URL from thumbnail
+        # Format: https://clips-media-assets2.twitch.tv/AT-cm%7Cxxx-preview-480x272.jpg
         download_url = ""
         if "-preview-" in thumb:
             download_url = thumb.split("-preview-")[0] + ".mp4"
+        elif thumb:
+            # Fallback: try removing the file extension portion
+            base = thumb.rsplit("/", 1)
+            if len(base) == 2:
+                download_url = base[0] + "/" + base[1].split("-")[0] + ".mp4"
 
         clips.append(ClipMeta(
             clip_id=c["id"],

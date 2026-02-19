@@ -42,9 +42,11 @@ PROFILE = {
 
 # Creators: (platform, login/slug, display_name)
 CREATORS = [
-    ("twitch", "xqc", "xQc"),
-    ("twitch", "adinross", "Adin Ross"),
-    ("twitch", "jackdoherty", "Jack Doherty"),
+    # Twitch
+    ("twitch", "braeden", "Braeden"),
+    ("twitch", "agent00", "Agent00"),
+    ("twitch", "2xrakai", "2xRaKai"),
+    # Kick
     ("kick", "xqc", "xQc"),
     ("kick", "adinross", "Adin Ross"),
     ("kick", "jackdoherty", "Jack Doherty"),

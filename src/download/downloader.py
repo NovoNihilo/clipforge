@@ -2,7 +2,6 @@
 import asyncio
 import json
 import os
-import subprocess
 from pathlib import Path
 from src.db.database import get_db
 from src.models.schemas import ClipMeta, ClipStatus
@@ -19,23 +18,32 @@ def _asset_dir_for_clip(platform: str, clip_id: str) -> Path:
 
 
 async def download_twitch_clip(clip_meta: ClipMeta, dest_dir: Path) -> str | None:
-    """Download a Twitch clip MP4."""
-    if not clip_meta.download_url:
-        log.error(f"No download URL for Twitch clip {clip_meta.clip_id}")
-        return None
-
+    """Download a Twitch clip using yt-dlp (reliable, handles all URL formats)."""
+    clip_url = f"https://clips.twitch.tv/{clip_meta.clip_id}"
     dest = dest_dir / "source.mp4"
-    ok = await download_file(clip_meta.download_url, str(dest))
-    if ok and dest.exists() and dest.stat().st_size > 0:
-        return str(dest)
-    return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "--no-warnings",
+            "-o", str(dest),
+            clip_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+            return str(dest)
+        else:
+            log.error(f"yt-dlp failed for {clip_url}: {stderr.decode()[-500:]}")
+            return None
+    except FileNotFoundError:
+        log.error("yt-dlp not found! Install with: pip install yt-dlp")
+        return None
 
 
 async def download_kick_clip(clip_meta: ClipMeta, dest_dir: Path) -> str | None:
-    """
-    Download a Kick clip. Kick serves HLS (.m3u8), so we use ffmpeg to convert.
-    Falls back to direct download if it's an MP4 URL.
-    """
+    """Download a Kick clip via HLS URL using ffmpeg, or direct MP4."""
     url = clip_meta.download_url
     if not url:
         log.error(f"No download URL for Kick clip {clip_meta.clip_id}")
@@ -50,7 +58,7 @@ async def download_kick_clip(clip_meta: ClipMeta, dest_dir: Path) -> str | None:
             return str(dest)
         return None
 
-    # HLS → MP4 via ffmpeg
+    # HLS (.m3u8) → MP4 via ffmpeg
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
@@ -73,10 +81,7 @@ async def download_kick_clip(clip_meta: ClipMeta, dest_dir: Path) -> str | None:
 
 
 async def download_clip(clip_row_id: int) -> bool:
-    """
-    Download a single DISCOVERED clip. Updates DB status.
-    Returns True on success.
-    """
+    """Download a single DISCOVERED clip. Updates DB status."""
     db = get_db()
     row = db.execute("SELECT * FROM clips WHERE id = ? AND status = ?",
                      (clip_row_id, ClipStatus.DISCOVERED.value)).fetchone()
