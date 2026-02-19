@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # Twitch
     twitch_client_id: str = ""
     twitch_client_secret: str = ""
+    openai_api_key: str = ""
 
     # Paths
     database_path: str = "clipforge.db"
