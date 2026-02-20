@@ -2,6 +2,7 @@
 ClipForge — Full Pipeline Runner.
 
 Runs the entire pipeline end-to-end:
+  0. Archive previous outputs
   1. Discover new clips (last 24h, up to 3 per creator)
   2. Download discovered clips
   3. Transcribe + quality gates
@@ -17,6 +18,9 @@ Usage:
 import asyncio
 import argparse
 import json
+import shutil
+from datetime import datetime
+from pathlib import Path
 from rich import print as rprint
 from rich.console import Console
 
@@ -31,6 +35,48 @@ from src.utils.log import log
 
 console = Console()
 
+
+# ── Auto-archive ──────────────────────────────────────────────────────────────
+
+def archive_existing_outputs(profile_slug: str) -> int:
+    """
+    Move existing output packs from outputs/{profile_slug}/ into
+    archives/{profile_slug}/{YYYY-MM-DD}/
+
+    Returns count of packs archived.
+    """
+    outputs_dir = Path("outputs") / profile_slug
+    if not outputs_dir.exists():
+        return 0
+
+    # Only archive subdirectories (each pack is a folder)
+    packs = [d for d in outputs_dir.iterdir() if d.is_dir()]
+    if not packs:
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    archive_dir = Path("archives") / profile_slug / today
+
+    # If archive for today already exists (ran twice in one day), append counter
+    if archive_dir.exists():
+        counter = 2
+        while archive_dir.exists():
+            archive_dir = Path("archives") / profile_slug / f"{today}-{counter}"
+            counter += 1
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    archived = 0
+    for pack_dir in packs:
+        dest = archive_dir / pack_dir.name
+        shutil.move(str(pack_dir), str(dest))
+        archived += 1
+
+    log.info(f"📦 Archived {archived} output packs → {archive_dir}")
+    return archived
+
+
+# ── Pipeline status ───────────────────────────────────────────────────────────
 
 def show_pipeline_status(profile_slug: str):
     """Show current clip counts by status."""
@@ -55,12 +101,22 @@ def show_pipeline_status(profile_slug: str):
     rprint("")
 
 
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
 async def run_pipeline(profile_slug: str, skip_discover: bool = False, limit_per_creator: int = 3):
     """Run the full pipeline."""
-    rprint(f"\n[bold cyan]═══ ClipForge Pipeline: {profile_slug} ═══[/bold cyan]\n")
+    rprint(f"\n[bold cyan]══ ClipForge Pipeline: {profile_slug} ══[/bold cyan]\n")
 
     # Ensure DB exists
     init_db()
+
+    # ── Step 0: Archive previous outputs ──
+    archived = archive_existing_outputs(profile_slug)
+    if archived:
+        rprint(f"[bold]Step 0: Archived {archived} previous output packs[/bold]")
+        rprint(f"  → Moved to archives/{profile_slug}/\n")
+    else:
+        rprint("[dim]Step 0: No previous outputs to archive[/dim]\n")
 
     # ── Step 1: Discover ──
     if not skip_discover:
@@ -76,7 +132,6 @@ async def run_pipeline(profile_slug: str, skip_discover: bool = False, limit_per
     rprint(f"  → {dl_count} clips downloaded\n")
 
     if dl_count == 0:
-        # Check if there are any discovered clips left
         db = get_db()
         remaining = db.execute("""
             SELECT COUNT(*) as cnt FROM clips cl
@@ -116,7 +171,7 @@ async def run_pipeline(profile_slug: str, skip_discover: bool = False, limit_per
     else:
         rprint("[yellow]No new shorts produced this run.[/yellow]")
 
-    rprint(f"[bold cyan]═══ Pipeline complete ═══[/bold cyan]\n")
+    rprint(f"[bold cyan]══ Pipeline complete ══[/bold cyan]\n")
 
 
 def main():

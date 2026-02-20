@@ -46,13 +46,22 @@ CREATORS = [
     ("twitch", "braeden", "Braeden"),
     ("twitch", "agent00", "Agent00"),
     ("twitch", "2xrakai", "2xRaKai"),
+    ("twitch", "xqc", "xQC"),
+    ("twitch", "jasontheween", "JasonTheWeen"),
+    ("twitch", "botezlive", "BotezLive"),
+    ("twitch", "lacy", "Lacy"),
+    ("twitch", "jinnytty", "Jinnytty"),
+    ("twitch", "stableronaldo", "StableRonaldo"),
+    ("twitch", "adapt", "Adapt"),
+
     # Kick
     ("kick", "xqc", "xQc"),
     ("kick", "adinross", "Adin Ross"),
     ("kick", "jackdoherty", "Jack Doherty"),
     ("kick", "n3on", "N3on"),
     ("kick", "clavicular", "Clavicular"),
-    ("kick", "rampage", "RampageJackson"),
+    ("kick", "rampagejackson", "RampageJackson"),
+    ("kick", "vitaly", "Vitaly"),
 ]
 
 

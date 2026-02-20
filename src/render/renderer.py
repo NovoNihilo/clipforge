@@ -61,7 +61,7 @@ def _build_video_filter(src_w: int, src_h: int) -> str:
     # overlay [fg] centered on [bg]
 
     vf = (
-        "split[bg][fg];"
+        "[0:v]split[bg][fg];"
         # Background: scale to fill 1080x1920, crop center, blur heavily
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,"
@@ -322,59 +322,66 @@ async def render_clip(clip_row_id: int) -> bool:
 
     vf = video_layout + drawtext_chain
 
-    # Write filter to script file
-    filter_script = clip_dir / "filter_script.txt"
-    with open(filter_script, "w") as f:
-        f.write(vf)
+    # Write the unified filter_complex script
+    # Always use filter_complex (not -vf/-af) to avoid stream binding conflicts
+    # Video: [0:v] -> blur layout -> captions -> title -> [vout]
+    # Audio: either loudnorm only, or loudnorm + music mix -> [aout]
 
-    # Try to add background music
-    music_args = None
+    music_path = None
     try:
         from src.render.music_mixer import get_music_track, build_music_filter
         music_path = get_music_track(mood="funny")
-        if music_path:
-            music_args = build_music_filter(music_path, segment_duration)
     except ImportError:
         pass
 
-    if music_args:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(ed.segment.start),
-            "-i", source_path,
-        ] + music_args["input_args"] + [
-            "-t", str(segment_duration),
-            "-filter_complex_script", str(filter_script),
-            "-filter_complex", music_args["filter_complex"],
-        ] + music_args["output_map"] + [
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(ed.segment.start),
-            "-i", source_path,
-            "-t", str(segment_duration),
-            "-filter_complex_script", str(filter_script),
-            "-af", "loudnorm=I=-14:TP=-1:LRA=11",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
+    # Video chain: blur + overlay + captions + title -> [vout]
+    video_chain = video_layout + drawtext_chain + "[vout]"
 
-    has_music = " + music" if music_args else ""
+    # Audio chain
+    fade_start = max(0, segment_duration - 2.0)
+    if music_path:
+        audio_chain = (
+            f"[0:a]loudnorm=I=-14:TP=-1:LRA=11[speech];"
+            f"[1:a]atrim=0:{segment_duration:.1f},"
+            f"afade=t=in:st=0:d=1.0,"
+            f"afade=t=out:st={fade_start:.1f}:d=2.0,"
+            f"volume=0.10[music];"
+            f"[speech][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        )
+    else:
+        audio_chain = "[0:a]loudnorm=I=-14:TP=-1:LRA=11[aout]"
+
+    # Combine into single filter_complex
+    full_filter = video_chain + ";" + audio_chain
+
+    filter_script = clip_dir / "filter_script.txt"
+    with open(filter_script, "w") as f:
+        f.write(full_filter)
+
+    # Build command
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(ed.segment.start),
+        "-i", source_path,
+    ]
+    if music_path:
+        cmd += ["-i", music_path]
+    cmd += [
+        "-t", str(segment_duration),
+        "-filter_complex_script", str(filter_script),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    has_music = " + music" if music_path else ""
     has_word_ts = " + word-sync" if transcript.get("words") else ""
     log.info(f"  Running ffmpeg (blur layout + captions{has_word_ts}{has_music})...")
 
@@ -389,7 +396,7 @@ async def render_clip(clip_row_id: int) -> bool:
         err_text = stderr.decode()[-800:]
         log.error(f"  ffmpeg failed:\n{err_text}")
 
-        # Fallback: simple scale + pad without blur
+        # Fallback: simple scale + pad (no blur, no split = safe with -vf/-af)
         log.info("  Retrying with simple layout...")
         vf_simple = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
         if caption_chain:
@@ -397,8 +404,8 @@ async def render_clip(clip_row_id: int) -> bool:
         if title_filters:
             vf_simple += "," + title_filters
 
-        filter_script_simple = clip_dir / "filter_script_simple.txt"
-        with open(filter_script_simple, "w") as f:
+        fallback_script = clip_dir / "filter_fallback.txt"
+        with open(fallback_script, "w") as f:
             f.write(vf_simple)
 
         cmd_simple = [
@@ -406,7 +413,7 @@ async def render_clip(clip_row_id: int) -> bool:
             "-ss", str(ed.segment.start),
             "-i", source_path,
             "-t", str(segment_duration),
-            "-filter_complex_script", str(filter_script_simple),
+            "-filter_script:v", str(fallback_script),
             "-af", "loudnorm=I=-14:TP=-1:LRA=11",
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
