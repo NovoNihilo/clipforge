@@ -19,8 +19,8 @@ def _get_model():
         log.info("Loading whisper model (base.en) — first run downloads ~150MB...")
         _model = WhisperModel(
             "base.en",
-            device="cpu",           # faster-whisper uses CPU on macOS (no CUDA)
-            compute_type="int8",    # fast on Apple Silicon
+            device="cpu",
+            compute_type="int8",
         )
         log.info("Whisper model loaded")
     return _model
@@ -28,8 +28,12 @@ def _get_model():
 
 def transcribe_audio(audio_path: str) -> dict:
     """
-    Transcribe an audio/video file.
-    Returns {segments: [{start, end, text}...], language, duration, full_text}
+    Transcribe an audio/video file with WORD-LEVEL timestamps.
+    Returns {
+        segments: [{start, end, text, words: [{start, end, word}...]}...],
+        words: [{start, end, word}...],  # flat list of all words
+        language, duration, full_text
+    }
     """
     model = _get_model()
 
@@ -37,24 +41,40 @@ def transcribe_audio(audio_path: str) -> dict:
         audio_path,
         beam_size=5,
         language="en",
-        vad_filter=True,          # Voice Activity Detection — filters silence
+        vad_filter=True,
         vad_parameters=dict(
             min_silence_duration_ms=500,
         ),
+        word_timestamps=True,  # KEY: enables per-word timing
     )
 
     segments = []
+    all_words = []
     full_text_parts = []
+
     for seg in segments_raw:
+        seg_words = []
+        if seg.words:
+            for w in seg.words:
+                word_entry = {
+                    "start": round(w.start, 3),
+                    "end": round(w.end, 3),
+                    "word": w.word.strip(),
+                }
+                seg_words.append(word_entry)
+                all_words.append(word_entry)
+
         segments.append({
             "start": round(seg.start, 3),
             "end": round(seg.end, 3),
             "text": seg.text.strip(),
+            "words": seg_words,
         })
         full_text_parts.append(seg.text.strip())
 
     return {
         "segments": segments,
+        "words": all_words,
         "language": info.language,
         "language_probability": round(info.language_probability, 3),
         "duration": round(info.duration, 3),
@@ -65,78 +85,48 @@ def transcribe_audio(audio_path: str) -> dict:
 # ── Quality Gates ──
 
 def gate_hook(transcript: dict, rules: ProfileRules) -> tuple[bool, str]:
-    """
-    Hook gate: reject if first spoken word starts after hook_max_delay_sec.
-    Rationale: viewers scroll away if nothing happens in first 2 seconds.
-    """
     if not transcript["segments"]:
         return False, "no_speech_detected"
-
     first_start = transcript["segments"][0]["start"]
     if first_start > rules.hook_max_delay_sec:
         return False, f"hook_too_late:{first_start:.1f}s>(max {rules.hook_max_delay_sec}s)"
-
     return True, ""
 
 
 def gate_silence(transcript: dict, rules: ProfileRules) -> tuple[bool, str]:
-    """
-    Silence gate: reject if silence_ratio > threshold.
-    silence_ratio = 1 - (total_speech_duration / total_clip_duration)
-    """
     total_duration = transcript["duration"]
     if total_duration <= 0:
         return False, "zero_duration"
-
-    speech_duration = sum(
-        seg["end"] - seg["start"] for seg in transcript["segments"]
-    )
+    speech_duration = sum(seg["end"] - seg["start"] for seg in transcript["segments"])
     silence_ratio = 1.0 - (speech_duration / total_duration)
-
-    if silence_ratio > rules.silence_ratio_max + 0.001:  # small epsilon for float comparison
+    if silence_ratio > rules.silence_ratio_max:
         return False, f"too_silent:{silence_ratio:.0%}>(max {rules.silence_ratio_max:.0%})"
-
     return True, ""
 
 
 def gate_length(transcript: dict, rules: ProfileRules) -> tuple[bool, str]:
-    """
-    Length gate: reject if clip duration is outside the profile's length band.
-    """
     dur = transcript["duration"]
     min_len, max_len = rules.length_band_sec
-
     if dur < min_len:
         return False, f"too_short:{dur:.0f}s<(min {min_len}s)"
     if dur > max_len:
-        # Don't reject long clips — we'll trim them in the edit decision.
-        # But flag if way too long (>3x max)
         if dur > max_len * 3:
             return False, f"way_too_long:{dur:.0f}s>(max {max_len * 3}s)"
-
     return True, ""
 
 
 def run_quality_gates(transcript: dict, rules: ProfileRules) -> tuple[bool, str]:
-    """Run all quality gates. Returns (passed, reason)."""
-    gates = [
-        ("hook", gate_hook),
-        ("silence", gate_silence),
-        ("length", gate_length),
-    ]
-
+    gates = [("hook", gate_hook), ("silence", gate_silence), ("length", gate_length)]
     for name, gate_fn in gates:
         passed, reason = gate_fn(transcript, rules)
         if not passed:
             return False, reason
-
     return True, ""
 
 
 # ── Orchestrator ──
 
 async def transcribe_clip(clip_row_id: int) -> bool:
-    """Transcribe a DOWNLOADED clip, apply quality gates, update DB."""
     db = get_db()
     row = db.execute("""
         SELECT cl.*, p.rules_json
@@ -166,7 +156,6 @@ async def transcribe_clip(clip_row_id: int) -> bool:
 
     log.info(f"Transcribing: {clip_meta.title} ({row['platform']}/{row['clip_id']})")
 
-    # Run transcription in executor (CPU-bound)
     loop = asyncio.get_event_loop()
     try:
         transcript = await loop.run_in_executor(None, transcribe_audio, source_path)
@@ -180,37 +169,27 @@ async def transcribe_clip(clip_row_id: int) -> bool:
         db.close()
         return False
 
-    # Save transcript to disk
     transcript_path = Path(source_path).parent / "transcript.json"
     with open(transcript_path, "w") as f:
         json.dump(transcript, f, indent=2)
 
-    # Update paths
     paths["transcript"] = str(transcript_path)
-
-    # Run quality gates
     passed, fail_reason = run_quality_gates(transcript, rules)
 
     if passed:
         db.execute("""
-            UPDATE clips SET
-                status = ?,
-                paths_json = ?,
-                updated_at = datetime('now')
+            UPDATE clips SET status = ?, paths_json = ?, updated_at = datetime('now')
             WHERE id = ?
         """, (ClipStatus.TRANSCRIBED.value, json.dumps(paths), clip_row_id))
         db.commit()
         db.close()
-        log.info(f"  ✅ Transcribed ({len(transcript['segments'])} segments, {transcript['duration']:.0f}s)")
+        word_count = len(transcript.get("words", []))
+        log.info(f"  ✅ Transcribed ({len(transcript['segments'])} segments, {word_count} words, {transcript['duration']:.0f}s)")
         log.info(f"  Text: {transcript['full_text'][:100]}...")
         return True
     else:
         db.execute("""
-            UPDATE clips SET
-                status = ?,
-                fail_reason = ?,
-                paths_json = ?,
-                updated_at = datetime('now')
+            UPDATE clips SET status = ?, fail_reason = ?, paths_json = ?, updated_at = datetime('now')
             WHERE id = ?
         """, (ClipStatus.FAILED.value, fail_reason, json.dumps(paths), clip_row_id))
         db.commit()
@@ -220,7 +199,6 @@ async def transcribe_clip(clip_row_id: int) -> bool:
 
 
 async def transcribe_downloaded_clips(profile_slug: str, limit: int = 10) -> dict:
-    """Transcribe all DOWNLOADED clips for a profile. Returns stats."""
     db = get_db()
     rows = db.execute("""
         SELECT cl.id FROM clips cl
@@ -232,12 +210,10 @@ async def transcribe_downloaded_clips(profile_slug: str, limit: int = 10) -> dic
     db.close()
 
     stats = {"total": len(rows), "passed": 0, "failed": 0}
-
     for row in rows:
         ok = await transcribe_clip(row["id"])
         if ok:
             stats["passed"] += 1
         else:
             stats["failed"] += 1
-
     return stats
