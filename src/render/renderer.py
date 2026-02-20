@@ -1,11 +1,12 @@
 """
-Milestone 4 v5: Render shorts.
+Milestone 4 v6: Render shorts.
 
 - Blurred background + centered overlay (shows more of original frame)
 - Word-level caption timing (uses word timestamps from transcript)
 - Bold white Impact captions
 - Large persistent title overlay
 - Optional background music mixing
+- Fixed: captions no longer appear early during silence gaps
 """
 import asyncio
 import json
@@ -54,21 +55,12 @@ def _build_video_filter(src_w: int, src_h: int) -> str:
     if src_w <= 0 or src_h <= 0:
         src_w, src_h = 1920, 1080
 
-    # Split into two streams using the split filter:
-    # [0:v] -> split -> [bg] and [fg]
-    # [bg] -> scale to fill 1080x1920 (crop to fit) -> blur
-    # [fg] -> scale to fit within 1080x1920 (maintain aspect ratio)
-    # overlay [fg] centered on [bg]
-
     vf = (
         "[0:v]split[bg][fg];"
-        # Background: scale to fill 1080x1920, crop center, blur heavily
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,"
         "boxblur=20:5[blurred];"
-        # Foreground: scale to fit width 1080, maintain aspect ratio
         "[fg]scale=1080:-2[sharp];"
-        # Overlay sharp on blurred, centered
         "[blurred][sharp]overlay=(W-w)/2:(H-h)/2"
     )
     return vf
@@ -91,12 +83,18 @@ def _build_caption_filters(
 ) -> str:
     """
     Build caption filters using WORD-LEVEL timestamps when available.
-    Falls back to even distribution if word timestamps are missing.
+    Falls back to per-segment timestamps (not even distribution) if word
+    timestamps are missing.
+
+    Key fix: each caption chunk is tightly bound to its actual speech timing.
+    Silence gaps between chunks produce no visible captions.
     """
     filters = []
     FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
 
-    # Check if we have word-level timestamps
+    # Small padding so captions don't vanish mid-syllable
+    TAIL_PAD = 0.15  # seconds to hold caption after last word ends
+
     has_word_timestamps = bool(transcript.get("words"))
 
     if has_word_timestamps:
@@ -115,13 +113,18 @@ def _build_caption_filters(
             if not chunk_words:
                 continue
 
-            # Chunk timing from first word start to last word end
+            # Tight timing: first word start → last word end + small pad
             c_start = chunk_words[0]["start"] - segment.start
-            c_end = chunk_words[-1]["end"] - segment.start
+            c_end = chunk_words[-1]["end"] - segment.start + TAIL_PAD
 
             # Clamp to valid range
             c_start = max(0, c_start)
             c_end = max(c_start + 0.1, c_end)
+
+            # Don't let this chunk bleed into the next chunk's start
+            if i + max_words < len(seg_words):
+                next_start = seg_words[i + max_words]["start"] - segment.start
+                c_end = min(c_end, next_start)
 
             chunk_text = " ".join(w["word"] for w in chunk_words)
             escaped = _escape_drawtext(chunk_text.upper())
@@ -138,14 +141,17 @@ def _build_caption_filters(
                 f":enable='between(t\\,{c_start:.3f}\\,{c_end:.3f})'"
             )
     else:
-        # Fallback: even distribution across segment timestamps
+        # Fallback: use ACTUAL segment timestamps from Whisper (not even distribution).
+        # This ensures captions only appear when speech was detected.
         for seg in transcript.get("segments", []):
             seg_start = seg["start"]
             seg_end = seg["end"]
 
+            # Skip segments outside our edit window
             if seg_end <= segment.start or seg_start >= segment.end:
                 continue
 
+            # Clamp to edit window
             seg_start = max(seg_start, segment.start)
             seg_end = min(seg_end, segment.end)
             rel_start = seg_start - segment.start
@@ -166,6 +172,9 @@ def _build_caption_filters(
             if not chunks:
                 continue
 
+            # Distribute chunks proportionally within this SEGMENT's timespan only.
+            # Crucially, this only covers the time when speech is happening,
+            # not the silence between segments.
             chunk_duration = (rel_end - rel_start) / len(chunks)
 
             for i, chunk in enumerate(chunks):
@@ -320,16 +329,10 @@ async def render_clip(clip_row_id: int) -> bool:
     if title_filters:
         drawtext_chain += "," + title_filters
 
-    vf = video_layout + drawtext_chain
-
-    # Write the unified filter_complex script
-    # Always use filter_complex (not -vf/-af) to avoid stream binding conflicts
-    # Video: [0:v] -> blur layout -> captions -> title -> [vout]
-    # Audio: either loudnorm only, or loudnorm + music mix -> [aout]
-
+    # Music handling
     music_path = None
     try:
-        from src.render.music_mixer import get_music_track, build_music_filter
+        from src.render.music_mixer import get_music_track
         music_path = get_music_track(mood="funny")
     except ImportError:
         pass

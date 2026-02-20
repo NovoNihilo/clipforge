@@ -1,0 +1,19 @@
+{
+  "clip_id": "BloodyProudShingleTBTacoRight-_wSoBUlrVnEDSqxH",
+  "platform": "twitch",
+  "creator": "Agent00",
+  "creator_url": "https://twitch.tv/agent00",
+  "title": "OMFG?????",
+  "original_duration_sec": 30.0,
+  "view_count": 1517,
+  "created_at": "2026-02-15T19:55:40Z",
+  "profile": "funny-streamers",
+  "segment": {
+    "start": 0.4,
+    "end": 28.1
+  },
+  "files": {
+    "video": "rendered.mp4",
+    "thumbnail": "thumbnail.jpg"
+  }
+}
