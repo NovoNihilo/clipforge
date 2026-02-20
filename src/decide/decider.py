@@ -6,7 +6,7 @@ Returns a structured EditDecision with:
   - Best segment to extract (start/end)
   - Viral score (1-10)
   - Platform-specific post copy (title, caption, hashtags)
-  - Layout + caption config
+  - Content safety assessment
 """
 import asyncio
 import json
@@ -19,10 +19,14 @@ from src.models.schemas import (
 )
 from src.config import settings
 from src.utils.log import log
+from src.moderation.content_mod import content_pre_filter
 
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4.1"
+
+
+# ── LLM prompts ──────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert short-form video editor for social media.
 You analyze clip transcripts and metadata to make edit decisions for viral shorts.
@@ -31,6 +35,7 @@ Your job:
 1. Pick the BEST segment (start_sec, end_sec) that would make the most engaging short
 2. Score its viral potential (1-10)
 3. Write platform-specific post copy
+4. Assess content safety for maximum platform distribution
 
 Rules:
 - The segment MUST start with a strong hook (funny moment, shocking statement, or energy shift)
@@ -41,6 +46,30 @@ Rules:
 - Post copy should be short, punchy, and use the creator's voice/energy
 - Hashtags should mix niche tags with broad viral tags
 
+CONTENT SAFETY — CRITICAL FOR DISTRIBUTION:
+You MUST evaluate the transcript for platform safety. Set "content_safe" to false if ANY of these are present:
+
+INSTANT REJECT (content_safe = false, viral_score = 0):
+- Racial slurs, homophobic slurs, or any hate speech
+- Gambling, casino, slots, betting, or Stake.com sponsored content
+- Explicit sexual descriptions, porn references, or nudity discussion
+- Any sexual content involving minors — ABSOLUTE zero tolerance
+- Fetish content, BDSM references, or graphic sexual acts
+- Extreme violence, gore, or credible threats
+- Targeted harassment, bullying, doxxing, or swatting
+- Promotion of self-harm, eating disorders, or dangerous challenges
+- Drug use glorification (casual weed references are OK)
+
+OK / SAFE CONTENT:
+- Occasional profanity (f-bombs, "shit", etc.) — normal for streaming, our renderer will bleep these
+- Mild sexual innuendo, jokes, flirting, suggestive humor without explicit detail
+- Playful trash talk between friends
+- Comedic violence in games (GTA, Fortnite, etc.)
+- Edgy humor that doesn't cross into hate speech
+
+THE KEY QUESTION: Would this clip get demonetized or shadow-banned on YouTube/TikTok/Instagram?
+If yes → content_safe = false. If borderline → err on the side of rejection.
+
 You MUST respond with ONLY a JSON object (no markdown, no backticks, no explanation).
 The JSON must have exactly this structure:
 
@@ -50,6 +79,8 @@ The JSON must have exactly this structure:
   "viral_score": <int 1-10>,
   "viral_reason": "<1 sentence why this would go viral>",
   "hook_description": "<what happens in the first 2 seconds>",
+  "content_safe": <true or false>,
+  "content_flag": "<empty string if safe, otherwise brief reason why unsafe>",
   "post_copy": {{
     "shorts": {{
       "title": "<YouTube Shorts title, max 100 chars>",
@@ -93,8 +124,10 @@ TRANSCRIPT (with timestamps):
 
 FULL TEXT: {transcript.get('full_text', '')}
 
-Pick the best segment and generate post copy. Respond with ONLY JSON."""
+Pick the best segment, evaluate content safety, and generate post copy. Respond with ONLY JSON."""
 
+
+# ── OpenAI API ────────────────────────────────────────────────────────────────
 
 async def call_openai_api(system: str, user_msg: str) -> dict | None:
     api_key = settings.openai_api_key
@@ -184,6 +217,8 @@ def _llm_response_to_edit_decision(
     )
 
 
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
 async def decide_clip(clip_row_id: int) -> bool:
     db = get_db()
     row = db.execute("""
@@ -219,6 +254,19 @@ async def decide_clip(clip_row_id: int) -> bool:
 
     log.info(f"Deciding: {clip_meta.title} ({row['platform']}/{row['clip_id'][:30]}...)")
 
+    # ── Layer 1: Fast keyword pre-filter (saves API calls) ──
+    safe, reason = content_pre_filter(transcript.get("full_text", ""))
+    if not safe:
+        log.warning(f"  🚫 Content pre-filter: {reason}")
+        db.execute("""
+            UPDATE clips SET status = ?, fail_reason = ?, updated_at = datetime('now')
+            WHERE id = ?
+        """, (ClipStatus.FAILED.value, reason, clip_row_id))
+        db.commit()
+        db.close()
+        return False
+
+    # ── Layer 2: LLM decision (with content safety assessment) ──
     system = SYSTEM_PROMPT.format(
         min_len=rules.length_band_sec[0],
         max_len=rules.length_band_sec[1],
@@ -232,6 +280,30 @@ async def decide_clip(clip_row_id: int) -> bool:
             UPDATE clips SET status = ?, fail_reason = 'llm_call_failed', updated_at = datetime('now')
             WHERE id = ?
         """, (ClipStatus.FAILED.value, clip_row_id))
+        db.commit()
+        db.close()
+        return False
+
+    # Check LLM content safety verdict
+    if not llm_resp.get("content_safe", True):
+        content_flag = llm_resp.get("content_flag", "flagged_by_llm")
+        log.warning(f"  🚫 Content flagged by LLM: {content_flag}")
+        db.execute("""
+            UPDATE clips SET status = ?, fail_reason = ?, updated_at = datetime('now')
+            WHERE id = ?
+        """, (ClipStatus.FAILED.value, f"content_unsafe:{content_flag}", clip_row_id))
+        db.commit()
+        db.close()
+        return False
+
+    # Check viral score — reject low scores
+    viral_score = llm_resp.get("viral_score", 0)
+    if viral_score < 3:
+        log.warning(f"  ⏭ Low viral score ({viral_score}/10), skipping")
+        db.execute("""
+            UPDATE clips SET status = ?, fail_reason = ?, updated_at = datetime('now')
+            WHERE id = ?
+        """, (ClipStatus.FAILED.value, f"low_viral_score:{viral_score}", clip_row_id))
         db.commit()
         db.close()
         return False
@@ -264,7 +336,6 @@ async def decide_clip(clip_row_id: int) -> bool:
     db.commit()
     db.close()
 
-    viral_score = llm_resp.get("viral_score", "?")
     viral_reason = llm_resp.get("viral_reason", "")
     seg = edit_decision.segment
     log.info(f"  ✅ Decided: score={viral_score}/10, segment={seg.start:.1f}-{seg.end:.1f}s")

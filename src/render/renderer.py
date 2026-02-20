@@ -1,12 +1,12 @@
 """
-Milestone 4 v6: Render shorts.
+Milestone 4 v7: Render shorts.
 
-- Blurred background + centered overlay (shows more of original frame)
-- Word-level caption timing (uses word timestamps from transcript)
-- Bold white Impact captions
+- Blurred background + centered overlay
+- Word-level caption timing with silence gap fix
+- Bold white Impact captions with profanity censoring ([BLEEP])
+- Audio muting of profanity at exact word timestamps
 - Large persistent title overlay
 - Optional background music mixing
-- Fixed: captions no longer appear early during silence gaps
 """
 import asyncio
 import json
@@ -17,6 +17,11 @@ from src.db.database import get_db
 from src.models.schemas import ClipMeta, ClipStatus, EditDecision, Segment
 from src.config import settings
 from src.utils.log import log
+from src.moderation.content_mod import get_bleep_map, BLEEP_WORDS
+
+
+def _clean_word(word: str) -> str:
+    return re.sub(r'[^a-z]', '', word.lower())
 
 
 async def probe_video(source_path: str) -> dict:
@@ -40,18 +45,6 @@ async def probe_video(source_path: str) -> dict:
 
 
 def _build_video_filter(src_w: int, src_h: int) -> str:
-    """
-    Blurred background + centered overlay layout.
-
-    Instead of cropping (which loses most of the frame), we:
-    1. Scale + blur the full frame as a 1080x1920 background
-    2. Scale the original to fit width (1080px wide), maintaining aspect ratio
-    3. Overlay the sharp original centered on the blurred background
-
-    For 16:9 source (1920x1080):
-      - Background: blurred, scaled to fill 1080x1920
-      - Overlay: 1080x608, centered vertically (with ~656px of blur visible top+bottom)
-    """
     if src_w <= 0 or src_h <= 0:
         src_w, src_h = 1920, 1080
 
@@ -76,57 +69,52 @@ def _escape_drawtext(text: str) -> str:
     return escaped
 
 
+def _censor_word(word: str) -> str:
+    """Replace profanity with [BLEEP] for caption display."""
+    if _clean_word(word) in BLEEP_WORDS:
+        return "[BLEEP]"
+    return word
+
+
 def _build_caption_filters(
     transcript: dict,
     segment: Segment,
     max_words: int = 3,
 ) -> str:
     """
-    Build caption filters using WORD-LEVEL timestamps when available.
-    Falls back to per-segment timestamps (not even distribution) if word
-    timestamps are missing.
-
-    Key fix: each caption chunk is tightly bound to its actual speech timing.
-    Silence gaps between chunks produce no visible captions.
+    Build caption filters with profanity replaced by [BLEEP].
+    Uses word-level timestamps when available.
     """
     filters = []
     FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
-
-    # Small padding so captions don't vanish mid-syllable
-    TAIL_PAD = 0.15  # seconds to hold caption after last word ends
+    TAIL_PAD = 0.15
 
     has_word_timestamps = bool(transcript.get("words"))
 
     if has_word_timestamps:
-        # Use precise word timestamps — group into chunks of max_words
         words = transcript["words"]
-
-        # Filter words within our segment
         seg_words = [
             w for w in words
             if w["end"] > segment.start and w["start"] < segment.end
         ]
 
-        # Group into chunks
         for i in range(0, len(seg_words), max_words):
             chunk_words = seg_words[i:i + max_words]
             if not chunk_words:
                 continue
 
-            # Tight timing: first word start → last word end + small pad
             c_start = chunk_words[0]["start"] - segment.start
             c_end = chunk_words[-1]["end"] - segment.start + TAIL_PAD
 
-            # Clamp to valid range
             c_start = max(0, c_start)
             c_end = max(c_start + 0.1, c_end)
 
-            # Don't let this chunk bleed into the next chunk's start
             if i + max_words < len(seg_words):
                 next_start = seg_words[i + max_words]["start"] - segment.start
                 c_end = min(c_end, next_start)
 
-            chunk_text = " ".join(w["word"] for w in chunk_words)
+            # Censor profanity in caption text
+            chunk_text = " ".join(_censor_word(w["word"]) for w in chunk_words)
             escaped = _escape_drawtext(chunk_text.upper())
 
             filters.append(
@@ -141,17 +129,13 @@ def _build_caption_filters(
                 f":enable='between(t\\,{c_start:.3f}\\,{c_end:.3f})'"
             )
     else:
-        # Fallback: use ACTUAL segment timestamps from Whisper (not even distribution).
-        # This ensures captions only appear when speech was detected.
         for seg in transcript.get("segments", []):
             seg_start = seg["start"]
             seg_end = seg["end"]
 
-            # Skip segments outside our edit window
             if seg_end <= segment.start or seg_start >= segment.end:
                 continue
 
-            # Clamp to edit window
             seg_start = max(seg_start, segment.start)
             seg_end = min(seg_end, segment.end)
             rel_start = seg_start - segment.start
@@ -165,21 +149,21 @@ def _build_caption_filters(
             if not words:
                 continue
 
+            # Censor profanity
+            censored_words = [_censor_word(w) for w in words]
+
             chunks = []
-            for i in range(0, len(words), max_words):
-                chunks.append(" ".join(words[i:i + max_words]))
+            for ci in range(0, len(censored_words), max_words):
+                chunks.append(" ".join(censored_words[ci:ci + max_words]))
 
             if not chunks:
                 continue
 
-            # Distribute chunks proportionally within this SEGMENT's timespan only.
-            # Crucially, this only covers the time when speech is happening,
-            # not the silence between segments.
             chunk_duration = (rel_end - rel_start) / len(chunks)
 
-            for i, chunk in enumerate(chunks):
-                c_start = rel_start + i * chunk_duration
-                c_end = rel_start + (i + 1) * chunk_duration
+            for ci, chunk in enumerate(chunks):
+                c_start = rel_start + ci * chunk_duration
+                c_end = rel_start + (ci + 1) * chunk_duration
                 escaped = _escape_drawtext(chunk.upper())
 
                 filters.append(
@@ -195,6 +179,39 @@ def _build_caption_filters(
                 )
 
     return ",".join(filters) if filters else ""
+
+
+def _build_bleep_audio_filter(
+    bleep_map: list[dict],
+    segment_start: float,
+) -> str:
+    """
+    Build an ffmpeg audio filter that mutes audio at exact word timestamps.
+
+    Uses volume=enable to drop volume to 0 during each bleeped word.
+    Example: volume=0:enable='between(t,1.2,1.5)+between(t,4.8,5.1)'
+    """
+    if not bleep_map:
+        return ""
+
+    # Build enable expression: between(t,start,end)+between(t,start,end)+...
+    # Each + acts as OR in ffmpeg expressions
+    conditions = []
+    for b in bleep_map:
+        rel_start = b["start"] - segment_start
+        rel_end = b["end"] - segment_start
+        # Add small padding so the mute fully covers the word
+        rel_start = max(0, rel_start - 0.05)
+        rel_end = rel_end + 0.05
+        conditions.append(f"between(t\\,{rel_start:.3f}\\,{rel_end:.3f})")
+
+    enable_expr = "+".join(conditions)
+
+    # volume=0 when any bleep condition is true, volume=1 otherwise
+    # We achieve this with two volume filters:
+    # 1. Main audio at full volume
+    # 2. Multiply by 0 during bleep windows
+    return f"volume=0:enable='{enable_expr}'"
 
 
 def _strip_emojis(text: str) -> str:
@@ -310,7 +327,10 @@ async def render_clip(clip_row_id: int) -> bool:
     output_path = clip_dir / "rendered.mp4"
     segment_duration = ed.segment.end - ed.segment.start
 
-    # Build blurred background + overlay filter
+    # Get bleep map for this segment
+    bleep_map = get_bleep_map(transcript, ed.segment.start, ed.segment.end)
+
+    # Build video filters
     video_layout = _build_video_filter(src_w, src_h)
 
     caption_chain = _build_caption_filters(
@@ -320,9 +340,6 @@ async def render_clip(clip_row_id: int) -> bool:
 
     title_filters = _build_title_filters(clip_title, duration=segment_duration)
 
-    # Build the full filter_complex:
-    # video_layout produces the base 1080x1920 frame
-    # then chain drawtext filters for captions and title
     drawtext_chain = ""
     if caption_chain:
         drawtext_chain += "," + caption_chain
@@ -340,19 +357,36 @@ async def render_clip(clip_row_id: int) -> bool:
     # Video chain: blur + overlay + captions + title -> [vout]
     video_chain = video_layout + drawtext_chain + "[vout]"
 
-    # Audio chain
+    # Audio chain with bleeping
     fade_start = max(0, segment_duration - 2.0)
+    bleep_filter = _build_bleep_audio_filter(bleep_map, ed.segment.start)
+
     if music_path:
-        audio_chain = (
-            f"[0:a]loudnorm=I=-14:TP=-1:LRA=11[speech];"
-            f"[1:a]atrim=0:{segment_duration:.1f},"
-            f"afade=t=in:st=0:d=1.0,"
-            f"afade=t=out:st={fade_start:.1f}:d=2.0,"
-            f"volume=0.10[music];"
-            f"[speech][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
+        # With music: loudnorm -> bleep -> mix with music
+        if bleep_filter:
+            audio_chain = (
+                f"[0:a]loudnorm=I=-14:TP=-1:LRA=11,{bleep_filter}[speech];"
+                f"[1:a]atrim=0:{segment_duration:.1f},"
+                f"afade=t=in:st=0:d=1.0,"
+                f"afade=t=out:st={fade_start:.1f}:d=2.0,"
+                f"volume=0.10[music];"
+                f"[speech][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            )
+        else:
+            audio_chain = (
+                f"[0:a]loudnorm=I=-14:TP=-1:LRA=11[speech];"
+                f"[1:a]atrim=0:{segment_duration:.1f},"
+                f"afade=t=in:st=0:d=1.0,"
+                f"afade=t=out:st={fade_start:.1f}:d=2.0,"
+                f"volume=0.10[music];"
+                f"[speech][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            )
     else:
-        audio_chain = "[0:a]loudnorm=I=-14:TP=-1:LRA=11[aout]"
+        # No music: loudnorm -> bleep
+        if bleep_filter:
+            audio_chain = f"[0:a]loudnorm=I=-14:TP=-1:LRA=11,{bleep_filter}[aout]"
+        else:
+            audio_chain = "[0:a]loudnorm=I=-14:TP=-1:LRA=11[aout]"
 
     # Combine into single filter_complex
     full_filter = video_chain + ";" + audio_chain
@@ -386,7 +420,8 @@ async def render_clip(clip_row_id: int) -> bool:
 
     has_music = " + music" if music_path else ""
     has_word_ts = " + word-sync" if transcript.get("words") else ""
-    log.info(f"  Running ffmpeg (blur layout + captions{has_word_ts}{has_music})...")
+    has_bleeps = f" + {len(bleep_map)} bleeps" if bleep_map else ""
+    log.info(f"  Running ffmpeg (blur layout + captions{has_word_ts}{has_bleeps}{has_music})...")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -399,7 +434,7 @@ async def render_clip(clip_row_id: int) -> bool:
         err_text = stderr.decode()[-800:]
         log.error(f"  ffmpeg failed:\n{err_text}")
 
-        # Fallback: simple scale + pad (no blur, no split = safe with -vf/-af)
+        # Fallback: simple layout (no blur)
         log.info("  Retrying with simple layout...")
         vf_simple = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
         if caption_chain:
@@ -411,13 +446,18 @@ async def render_clip(clip_row_id: int) -> bool:
         with open(fallback_script, "w") as f:
             f.write(vf_simple)
 
+        # Fallback audio: still bleep if we have a bleep map
+        af_simple = "loudnorm=I=-14:TP=-1:LRA=11"
+        if bleep_filter:
+            af_simple += f",{bleep_filter}"
+
         cmd_simple = [
             "ffmpeg", "-y",
             "-ss", str(ed.segment.start),
             "-i", source_path,
             "-t", str(segment_duration),
             "-filter_script:v", str(fallback_script),
-            "-af", "loudnorm=I=-14:TP=-1:LRA=11",
+            "-af", af_simple,
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-movflags", "+faststart",
@@ -432,7 +472,7 @@ async def render_clip(clip_row_id: int) -> bool:
         if proc2.returncode != 0:
             log.error(f"  Simple layout also failed:\n{stderr2.decode()[-500:]}")
 
-            # Last resort: no captions at all
+            # Last resort: no captions, no bleeps
             log.info("  Retrying without captions...")
             cmd_bare = [
                 "ffmpeg", "-y",
@@ -462,7 +502,7 @@ async def render_clip(clip_row_id: int) -> bool:
                 db.close()
                 return False
             else:
-                log.warning("  Rendered WITHOUT captions or blur (bare fallback)")
+                log.warning("  Rendered WITHOUT captions or bleeps (bare fallback)")
         else:
             log.warning("  Rendered with simple layout (blur failed)")
 
