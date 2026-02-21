@@ -142,7 +142,7 @@ async def discover_clips_for_creator(
     """
     if not last_fetched_at:
         # Default: clips from last 7 days
-        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        week_ago = datetime.now(timezone.utc) - timedelta(days=1)
         last_fetched_at = week_ago.isoformat()
 
     all_clips: list[ClipMeta] = []

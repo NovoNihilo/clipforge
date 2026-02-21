@@ -1,12 +1,12 @@
 """
-Milestone 4 v7: Render shorts.
+Milestone 4 v8: Render shorts.
 
-- Blurred background + centered overlay
-- Word-level caption timing with silence gap fix
-- Bold white Impact captions with profanity censoring ([BLEEP])
-- Audio muting of profanity at exact word timestamps
-- Large persistent title overlay
-- Optional background music mixing
+Changes from v7:
+  - 2-word caption chunks (configurable via caption_max_words)
+  - Speaker diarization: different caption colors per speaker
+  - Default caption color: yellow (was white)
+  - Speaker color rotation: yellow → cyan → pink → green
+  - Graceful fallback: if diarization unavailable, all captions use yellow
 """
 import asyncio
 import json
@@ -18,6 +18,24 @@ from src.models.schemas import ClipMeta, ClipStatus, EditDecision, Segment
 from src.config import settings
 from src.utils.log import log
 from src.moderation.content_mod import get_bleep_map, BLEEP_WORDS
+
+
+# ── Speaker color palette ─────────────────────────────────────────────────────
+# ffmpeg drawtext fontcolor values
+SPEAKER_COLORS = [
+    "yellow",       # SPEAKER_00 (default / primary speaker)
+    "cyan",         # SPEAKER_01
+    "#FF69B4",      # SPEAKER_02 (pink)
+    "#00FF7F",      # SPEAKER_03 (green)
+]
+
+def _speaker_color(speaker_id: str) -> str:
+    """Map speaker label to color. Defaults to yellow."""
+    try:
+        idx = int(speaker_id.split("_")[-1])
+        return SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
+    except (ValueError, IndexError):
+        return SPEAKER_COLORS[0]
 
 
 def _clean_word(word: str) -> str:
@@ -79,11 +97,14 @@ def _censor_word(word: str) -> str:
 def _build_caption_filters(
     transcript: dict,
     segment: Segment,
-    max_words: int = 3,
+    max_words: int = 2,
+    speaker_words: list[dict] | None = None,
 ) -> str:
     """
-    Build caption filters with profanity replaced by [BLEEP].
-    Uses word-level timestamps when available.
+    Build caption filters with:
+      - Configurable words-per-chunk (default 2)
+      - Per-speaker colors when diarization is available
+      - Profanity replaced by [BLEEP]
     """
     filters = []
     FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
@@ -92,7 +113,8 @@ def _build_caption_filters(
     has_word_timestamps = bool(transcript.get("words"))
 
     if has_word_timestamps:
-        words = transcript["words"]
+        # Use speaker-annotated words if available, else plain transcript words
+        words = speaker_words if speaker_words else transcript["words"]
         seg_words = [
             w for w in words
             if w["end"] > segment.start and w["start"] < segment.end
@@ -109,9 +131,14 @@ def _build_caption_filters(
             c_start = max(0, c_start)
             c_end = max(c_start + 0.1, c_end)
 
+            # Clamp to next chunk start
             if i + max_words < len(seg_words):
                 next_start = seg_words[i + max_words]["start"] - segment.start
                 c_end = min(c_end, next_start)
+
+            # Determine color from the first word's speaker in this chunk
+            speaker = chunk_words[0].get("speaker", "SPEAKER_00")
+            color = _speaker_color(speaker)
 
             # Censor profanity in caption text
             chunk_text = " ".join(_censor_word(w["word"]) for w in chunk_words)
@@ -120,7 +147,7 @@ def _build_caption_filters(
             filters.append(
                 f"drawtext=text='{escaped}'"
                 f":fontsize=80"
-                f":fontcolor=white"
+                f":fontcolor={color}"
                 f":fontfile={FONT}"
                 f":borderw=4"
                 f":bordercolor=black"
@@ -129,6 +156,7 @@ def _build_caption_filters(
                 f":enable='between(t\\,{c_start:.3f}\\,{c_end:.3f})'"
             )
     else:
+        # Fallback: no word timestamps — use segment-level timing, default yellow
         for seg in transcript.get("segments", []):
             seg_start = seg["start"]
             seg_end = seg["end"]
@@ -149,7 +177,6 @@ def _build_caption_filters(
             if not words:
                 continue
 
-            # Censor profanity
             censored_words = [_censor_word(w) for w in words]
 
             chunks = []
@@ -169,7 +196,7 @@ def _build_caption_filters(
                 filters.append(
                     f"drawtext=text='{escaped}'"
                     f":fontsize=80"
-                    f":fontcolor=white"
+                    f":fontcolor=yellow"
                     f":fontfile={FONT}"
                     f":borderw=4"
                     f":bordercolor=black"
@@ -185,32 +212,19 @@ def _build_bleep_audio_filter(
     bleep_map: list[dict],
     segment_start: float,
 ) -> str:
-    """
-    Build an ffmpeg audio filter that mutes audio at exact word timestamps.
-
-    Uses volume=enable to drop volume to 0 during each bleeped word.
-    Example: volume=0:enable='between(t,1.2,1.5)+between(t,4.8,5.1)'
-    """
+    """Build ffmpeg volume filter that mutes audio at bleep timestamps."""
     if not bleep_map:
         return ""
 
-    # Build enable expression: between(t,start,end)+between(t,start,end)+...
-    # Each + acts as OR in ffmpeg expressions
     conditions = []
     for b in bleep_map:
         rel_start = b["start"] - segment_start
         rel_end = b["end"] - segment_start
-        # Add small padding so the mute fully covers the word
         rel_start = max(0, rel_start - 0.05)
         rel_end = rel_end + 0.05
         conditions.append(f"between(t\\,{rel_start:.3f}\\,{rel_end:.3f})")
 
     enable_expr = "+".join(conditions)
-
-    # volume=0 when any bleep condition is true, volume=1 otherwise
-    # We achieve this with two volume filters:
-    # 1. Main audio at full volume
-    # 2. Multiply by 0 during bleep windows
     return f"volume=0:enable='{enable_expr}'"
 
 
@@ -330,12 +344,45 @@ async def render_clip(clip_row_id: int) -> bool:
     # Get bleep map for this segment
     bleep_map = get_bleep_map(transcript, ed.segment.start, ed.segment.end)
 
+    # ── Speaker diarization (optional) ────────────────────────────────────
+    speaker_words = None
+    try:
+        from src.render.diarize import diarize_speakers, assign_speakers_to_words
+
+        diarization_segments = diarize_speakers(
+            source_path,
+            segment_start=ed.segment.start,
+            segment_end=ed.segment.end,
+            min_speakers=1,
+            max_speakers=4,
+        )
+        if diarization_segments:
+            # Deep copy words to avoid mutating transcript
+            import copy
+            words_copy = copy.deepcopy(transcript.get("words", []))
+            speaker_words = assign_speakers_to_words(
+                words_copy,
+                diarization_segments,
+                segment_start=ed.segment.start,
+                segment_end=ed.segment.end,
+            )
+            unique = set(w.get("speaker", "SPEAKER_00") for w in speaker_words)
+            if len(unique) > 1:
+                log.info(f"  🎨 Speaker colors: {len(unique)} speakers → multi-color captions")
+            else:
+                log.info(f"  🎨 Single speaker → yellow captions")
+    except ImportError:
+        log.info("  Speaker diarization not available (pyannote not installed) → yellow captions")
+    except Exception as e:
+        log.warning(f"  Speaker diarization failed: {e} → yellow captions")
+
     # Build video filters
     video_layout = _build_video_filter(src_w, src_h)
 
     caption_chain = _build_caption_filters(
         transcript, ed.segment,
         max_words=ed.captions.max_words,
+        speaker_words=speaker_words,
     )
 
     title_filters = _build_title_filters(clip_title, duration=segment_duration)
@@ -362,7 +409,6 @@ async def render_clip(clip_row_id: int) -> bool:
     bleep_filter = _build_bleep_audio_filter(bleep_map, ed.segment.start)
 
     if music_path:
-        # With music: loudnorm -> bleep -> mix with music
         if bleep_filter:
             audio_chain = (
                 f"[0:a]loudnorm=I=-14:TP=-1:LRA=11,{bleep_filter}[speech];"
@@ -382,13 +428,11 @@ async def render_clip(clip_row_id: int) -> bool:
                 f"[speech][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
             )
     else:
-        # No music: loudnorm -> bleep
         if bleep_filter:
             audio_chain = f"[0:a]loudnorm=I=-14:TP=-1:LRA=11,{bleep_filter}[aout]"
         else:
             audio_chain = "[0:a]loudnorm=I=-14:TP=-1:LRA=11[aout]"
 
-    # Combine into single filter_complex
     full_filter = video_chain + ";" + audio_chain
 
     filter_script = clip_dir / "filter_script.txt"
@@ -421,7 +465,8 @@ async def render_clip(clip_row_id: int) -> bool:
     has_music = " + music" if music_path else ""
     has_word_ts = " + word-sync" if transcript.get("words") else ""
     has_bleeps = f" + {len(bleep_map)} bleeps" if bleep_map else ""
-    log.info(f"  Running ffmpeg (blur layout + captions{has_word_ts}{has_bleeps}{has_music})...")
+    has_speakers = f" + {len(set(w.get('speaker','') for w in (speaker_words or [])))} speakers" if speaker_words else ""
+    log.info(f"  Running ffmpeg (blur + captions{has_word_ts}{has_bleeps}{has_speakers}{has_music})...")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -446,7 +491,6 @@ async def render_clip(clip_row_id: int) -> bool:
         with open(fallback_script, "w") as f:
             f.write(vf_simple)
 
-        # Fallback audio: still bleep if we have a bleep map
         af_simple = "loudnorm=I=-14:TP=-1:LRA=11"
         if bleep_filter:
             af_simple += f",{bleep_filter}"
@@ -472,7 +516,6 @@ async def render_clip(clip_row_id: int) -> bool:
         if proc2.returncode != 0:
             log.error(f"  Simple layout also failed:\n{stderr2.decode()[-500:]}")
 
-            # Last resort: no captions, no bleeps
             log.info("  Retrying without captions...")
             cmd_bare = [
                 "ffmpeg", "-y",

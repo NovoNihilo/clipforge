@@ -1,11 +1,13 @@
 """
-Milestone 3: LLM Edit Decision Maker (OpenAI GPT-4.1).
+Milestone 3: LLM Edit Decision Maker.
 
-Sends transcript + clip metadata to OpenAI API.
+Supports OpenAI (GPT-4.1) and xAI (Grok) via auto-detection from .env.
+Set XAI_API_KEY for Grok, or OPENAI_API_KEY for OpenAI.
+
 Returns a structured EditDecision with:
   - Best segment to extract (start/end)
   - Viral score (1-10)
-  - Platform-specific post copy (title, caption, hashtags)
+  - Platform-specific post copy with creator-specific titles
   - Content safety assessment
 """
 import asyncio
@@ -20,10 +22,6 @@ from src.models.schemas import (
 from src.config import settings
 from src.utils.log import log
 from src.moderation.content_mod import content_pre_filter
-
-
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4.1"
 
 
 # ── LLM prompts ──────────────────────────────────────────────────────────────
@@ -43,8 +41,18 @@ Rules:
 - Target length: {min_len}-{max_len} seconds (the segment you pick must be within this range)
 - If the entire clip is good, use the full duration
 - If the clip is longer than {max_len}s, find the best {max_len}s window
-- Post copy should be short, punchy, and use the creator's voice/energy
 - Hashtags should mix niche tags with broad viral tags
+
+TITLE RULES — CRITICAL FOR ENGAGEMENT:
+- ALWAYS use the creator's name in titles. Never use generic pronouns like "he", "she", "him", "my", "me".
+- Good: "xQc loses it when chat roasts him" — creator name is right there
+- Bad: "He couldn't believe what happened" — who is "he"? No one will click
+- Good: "Adin Ross gets caught lacking on stream"
+- Bad: "Streamer has embarrassing moment"
+- The title should make someone who recognizes the creator WANT to click
+- Reference what actually happens in the clip, not vague clickbait
+- Keep titles punchy: 6-12 words max
+- Match the creator's energy and community vibe
 
 CONTENT SAFETY — CRITICAL FOR DISTRIBUTION:
 You MUST evaluate the transcript for platform safety. Set "content_safe" to false if ANY of these are present:
@@ -83,17 +91,17 @@ The JSON must have exactly this structure:
   "content_flag": "<empty string if safe, otherwise brief reason why unsafe>",
   "post_copy": {{
     "shorts": {{
-      "title": "<YouTube Shorts title, max 100 chars>",
+      "title": "<YouTube Shorts title using creator's name, max 100 chars>",
       "caption": "<YouTube description, 1-2 sentences>",
       "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"]
     }},
     "tiktok": {{
-      "title": "<TikTok caption, max 150 chars with hashtags inline>",
+      "title": "<TikTok caption using creator's name, max 150 chars with hashtags inline>",
       "caption": "",
       "hashtags": ["#tag1", "#tag2", "#tag3"]
     }},
     "reels": {{
-      "title": "<Instagram Reels caption, max 125 chars>",
+      "title": "<Instagram Reels caption using creator's name, max 125 chars>",
       "caption": "",
       "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4"]
     }}
@@ -116,6 +124,8 @@ CLIP INFO:
 - Views: {clip_meta.view_count:,}
 - Category: {clip_meta.game_name or 'Just Chatting'}
 
+IMPORTANT: The creator's name is "{clip_meta.creator_name}". You MUST use this name in all titles.
+
 PROFILE NICHE: {rules.niche}
 TARGET LENGTH: {rules.length_band_sec[0]}-{rules.length_band_sec[1]} seconds
 
@@ -124,27 +134,37 @@ TRANSCRIPT (with timestamps):
 
 FULL TEXT: {transcript.get('full_text', '')}
 
-Pick the best segment, evaluate content safety, and generate post copy. Respond with ONLY JSON."""
+Pick the best segment, evaluate content safety, and generate post copy. Use the creator's name in titles. Respond with ONLY JSON."""
 
 
-# ── OpenAI API ────────────────────────────────────────────────────────────────
+# ── LLM API call (supports OpenAI + xAI/Grok) ───────────────────────────────
 
-async def call_openai_api(system: str, user_msg: str) -> dict | None:
-    api_key = settings.openai_api_key
+async def call_llm_api(system: str, user_msg: str) -> dict | None:
+    """
+    Call whichever LLM is configured in .env.
+    Both OpenAI and xAI use the same /v1/chat/completions endpoint format.
+    """
+    api_key = settings.llm_api_key
     if not api_key:
-        log.error("OPENAI_API_KEY not set in .env")
+        log.error("No LLM API key set. Set OPENAI_API_KEY or XAI_API_KEY in .env")
         return None
+
+    base_url = settings.llm_base_url
+    model = settings.llm_model
+    provider = settings.llm_provider
+
+    log.info(f"  LLM: {provider} / {model}")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             resp = await client.post(
-                OPENAI_API_URL,
+                f"{base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": OPENAI_MODEL,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_msg},
@@ -168,13 +188,13 @@ async def call_openai_api(system: str, user_msg: str) -> dict | None:
             return json.loads(text)
 
         except httpx.HTTPStatusError as e:
-            log.error(f"OpenAI API error {e.response.status_code}: {e.response.text[:500]}")
+            log.error(f"{provider} API error {e.response.status_code}: {e.response.text[:500]}")
             return None
         except json.JSONDecodeError as e:
-            log.error(f"Failed to parse OpenAI response as JSON: {e}\nRaw: {text[:500]}")
+            log.error(f"Failed to parse {provider} response as JSON: {e}\nRaw: {text[:500]}")
             return None
         except Exception as e:
-            log.error(f"OpenAI API call failed: {e}")
+            log.error(f"{provider} API call failed: {e}")
             return None
 
 
@@ -266,14 +286,14 @@ async def decide_clip(clip_row_id: int) -> bool:
         db.close()
         return False
 
-    # ── Layer 2: LLM decision (with content safety assessment) ──
+    # ── Layer 2: LLM decision ──
     system = SYSTEM_PROMPT.format(
         min_len=rules.length_band_sec[0],
         max_len=rules.length_band_sec[1],
     )
     user_msg = _build_user_prompt(clip_meta, transcript, rules)
 
-    llm_resp = await call_openai_api(system, user_msg)
+    llm_resp = await call_llm_api(system, user_msg)
 
     if not llm_resp:
         db.execute("""
@@ -296,7 +316,7 @@ async def decide_clip(clip_row_id: int) -> bool:
         db.close()
         return False
 
-    # Check viral score — reject low scores
+    # Check viral score
     viral_score = llm_resp.get("viral_score", 0)
     if viral_score < 3:
         log.warning(f"  ⏭ Low viral score ({viral_score}/10), skipping")
@@ -329,10 +349,11 @@ async def decide_clip(clip_row_id: int) -> bool:
     db.execute("""
         UPDATE clips SET
             status = ?,
+            viral_score = ?,
             paths_json = ?,
             updated_at = datetime('now')
         WHERE id = ?
-    """, (ClipStatus.DECIDED.value, json.dumps(paths), clip_row_id))
+    """, (ClipStatus.DECIDED.value, viral_score, json.dumps(paths), clip_row_id))
     db.commit()
     db.close()
 

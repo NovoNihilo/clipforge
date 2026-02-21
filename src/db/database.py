@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS clips (
     status TEXT NOT NULL DEFAULT 'DISCOVERED',
     -- DISCOVERED -> DOWNLOADED -> TRANSCRIBED -> DECIDED -> RENDERED -> PACKAGED
     -- Any state can go to FAILED
+    viral_score INTEGER,              -- LLM viral score (1-10), set at DECIDED
     fail_reason TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     paths_json TEXT NOT NULL DEFAULT '{}',
@@ -62,11 +63,11 @@ CREATE TABLE IF NOT EXISTS cursors (
 CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status);
 CREATE INDEX IF NOT EXISTS idx_clips_profile ON clips(profile_id, status);
 """
-# Postgres upgrade notes:
-# - Replace INTEGER PRIMARY KEY AUTOINCREMENT with SERIAL PRIMARY KEY
-# - Replace datetime('now') with NOW()
-# - Replace TEXT for JSON columns with JSONB
-# - Add connection pooling (asyncpg or psycopg pool)
+
+# Migration: add viral_score column to existing DBs
+MIGRATIONS = [
+    "ALTER TABLE clips ADD COLUMN viral_score INTEGER",
+]
 
 
 def get_db(db_path: str | None = None) -> sqlite3.Connection:
@@ -80,8 +81,17 @@ def get_db(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> sqlite3.Connection:
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, then run migrations."""
     conn = get_db(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+
+    # Run migrations (ignore if column already exists)
+    for migration in MIGRATIONS:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     return conn

@@ -16,9 +16,9 @@ def _get_model():
     global _model
     if _model is None:
         from faster_whisper import WhisperModel
-        log.info("Loading whisper model (base.en) — first run downloads ~150MB...")
+        log.info("Loading whisper model...")
         _model = WhisperModel(
-            "base.en",
+            "medium.en",
             device="cpu",
             compute_type="int8",
         )
