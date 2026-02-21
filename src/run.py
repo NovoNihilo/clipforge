@@ -131,7 +131,7 @@ def select_top_clips(profile_slug: str, top_n: int) -> int:
     # We temporarily set them to FAILED with a recoverable reason
     for cid in cut_ids:
         db.execute("""
-            UPDATE clips SET status = 'FAILED', fail_reason = 'cut:below_top_n',
+            UPDATE clips SET status = 'SKIPPED', fail_reason = 'cut:below_top_n',
                 updated_at = datetime('now')
             WHERE id = ?
         """, (cid,))

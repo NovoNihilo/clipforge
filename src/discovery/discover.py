@@ -96,8 +96,9 @@ async def discover_for_profile(profile_slug: str, max_per_creator: int | None = 
                     ClipStatus.DISCOVERED.value,
                     clip.to_json(),
                 ))
-                if db.total_changes:
-                    new_clips.append({
+                cursor = db.execute("INSERT OR IGNORE INTO clips ...")
+                if cursor.rowcount > 0:
+                    new_clips.append(...)({
                         "clip_id": clip.clip_id,
                         "platform": clip.platform,
                         "title": clip.title,
