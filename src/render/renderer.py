@@ -19,6 +19,21 @@ from src.config import settings
 from src.utils.log import log
 from src.moderation.content_mod import get_bleep_map, BLEEP_WORDS
 
+from pathlib import Path as _Path
+
+def _get_font() -> str:
+    """Find Impact font with Linux/Docker fallback."""
+    for candidate in [
+        "/System/Library/Fonts/Supplemental/Impact.ttf",        # macOS
+        "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",   # Linux (ttf-mscorefonts)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", # Linux fallback
+    ]:
+        if _Path(candidate).exists():
+            return candidate
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"  # best guess
+
+FONT_PATH = _get_font()
+
 
 # ── Speaker color palette ─────────────────────────────────────────────────────
 # ffmpeg drawtext fontcolor values
@@ -107,7 +122,7 @@ def _build_caption_filters(
       - Profanity replaced by [BLEEP]
     """
     filters = []
-    FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
+    FONT = FONT_PATH
     TAIL_PAD = 0.15
 
     has_word_timestamps = bool(transcript.get("words"))
@@ -262,7 +277,7 @@ def _build_title_filters(title: str, duration: float) -> str:
     lines = lines[:3]
 
     filters = []
-    FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
+    FONT = FONT_PATH
     FONTSIZE = 72
     line_height = 90
     base_y = 100
@@ -439,16 +454,16 @@ async def render_clip(clip_row_id: int) -> bool:
     with open(filter_script, "w") as f:
         f.write(full_filter)
 
-    # Build command
+    # Build command — BUG 4 FIX: -t is now BEFORE -i source_path
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(ed.segment.start),
+        "-t", str(segment_duration),
         "-i", source_path,
     ]
     if music_path:
         cmd += ["-i", music_path]
     cmd += [
-        "-t", str(segment_duration),
         "-filter_complex_script", str(filter_script),
         "-map", "[vout]",
         "-map", "[aout]",
@@ -498,8 +513,8 @@ async def render_clip(clip_row_id: int) -> bool:
         cmd_simple = [
             "ffmpeg", "-y",
             "-ss", str(ed.segment.start),
-            "-i", source_path,
             "-t", str(segment_duration),
+            "-i", source_path,
             "-filter_script:v", str(fallback_script),
             "-af", af_simple,
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
@@ -520,8 +535,8 @@ async def render_clip(clip_row_id: int) -> bool:
             cmd_bare = [
                 "ffmpeg", "-y",
                 "-ss", str(ed.segment.start),
-                "-i", source_path,
                 "-t", str(segment_duration),
+                "-i", source_path,
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
                 "-af", "loudnorm=I=-14:TP=-1:LRA=11",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "23",

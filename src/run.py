@@ -38,6 +38,47 @@ from src.utils.log import log
 console = Console()
 
 
+# ── Clean previous run ─────────────────────────────────────────────────────────
+
+def clean_previous_run() -> dict:
+    """
+    Wipe all data from previous runs so each daily run starts fresh.
+    Deletes: assets/, outputs/, archives/, and all clip rows from DB.
+    Preserves: profiles, creators, profile_creators, cursors (so discovery
+    knows where it left off and only fetches last 24h).
+    """
+    stats = {"assets_mb": 0, "clips_deleted": 0}
+
+    # Delete asset files
+    assets_dir = Path("assets")
+    if assets_dir.exists():
+        for f in assets_dir.rglob("*"):
+            if f.is_file():
+                stats["assets_mb"] += f.stat().st_size
+        shutil.rmtree(assets_dir)
+    stats["assets_mb"] = round(stats["assets_mb"] / 1024 / 1024, 1)
+
+    # Delete outputs
+    outputs_dir = Path("outputs")
+    if outputs_dir.exists():
+        shutil.rmtree(outputs_dir)
+
+    # Delete archives
+    archives_dir = Path("archives")
+    if archives_dir.exists():
+        shutil.rmtree(archives_dir)
+
+    # Delete all clip rows from DB (keep profiles, creators, cursors)
+    db = get_db()
+    count = db.execute("SELECT COUNT(*) as cnt FROM clips").fetchone()["cnt"]
+    db.execute("DELETE FROM clips")
+    db.commit()
+    db.close()
+    stats["clips_deleted"] = count
+
+    return stats
+
+
 # ── Auto-archive ──────────────────────────────────────────────────────────────
 
 def archive_existing_outputs(profile_slug: str) -> int:
@@ -81,7 +122,7 @@ def archive_existing_outputs(profile_slug: str) -> int:
 def select_top_clips(profile_slug: str, top_n: int) -> int:
     """
     Among all RENDERED clips, keep only the top N by viral_score.
-    Demotes the rest to RENDERED_CUT so they don't get packaged.
+    Demotes the rest to SKIPPED so they can be reconsidered in future runs.
     Returns count of clips that made the cut.
     """
     db = get_db()
@@ -127,8 +168,7 @@ def select_top_clips(profile_slug: str, top_n: int) -> int:
     cut_scores = [str(r["viral_score"] or 0) for r in rendered[top_n:]]
     rprint(f"[dim]  Cut {len(cut_ids)} clips (scores: {', '.join(cut_scores)})[/dim]")
 
-    # Demote cut clips — they stay RENDERED in DB but won't be packaged this run
-    # We temporarily set them to FAILED with a recoverable reason
+    # Demote cut clips — use SKIPPED so they can be reconsidered in future runs
     for cid in cut_ids:
         db.execute("""
             UPDATE clips SET status = 'SKIPPED', fail_reason = 'cut:below_top_n',
@@ -158,7 +198,8 @@ def show_pipeline_status(profile_slug: str):
 
     emoji_map = {
         "DISCOVERED": "🔍", "DOWNLOADED": "⬇️", "TRANSCRIBED": "📝",
-        "DECIDED": "🧠", "RENDERED": "🎬", "PACKAGED": "📦", "FAILED": "❌",
+        "DECIDED": "🧠", "RENDERED": "🎬", "PACKAGED": "📦",
+        "SKIPPED": "⏭️", "FAILED": "❌",
     }
     rprint("\n[bold]Pipeline Status:[/bold]")
     for r in rows:
@@ -182,13 +223,13 @@ async def run_pipeline(
     # Ensure DB exists + run migrations
     init_db()
 
-    # ── Step 0: Archive previous outputs ──
-    archived = archive_existing_outputs(profile_slug)
-    if archived:
-        rprint(f"[bold]Step 0: Archived {archived} previous output packs[/bold]")
-        rprint(f"  → Moved to archives/{profile_slug}/\n")
+    # ── Step 0: Clean previous run ──
+    cleaned = clean_previous_run()
+    if cleaned["clips_deleted"] > 0 or cleaned["assets_mb"] > 0:
+        rprint(f"[bold]Step 0: Cleaned previous run[/bold]")
+        rprint(f"  → Deleted {cleaned['clips_deleted']} old clips, freed {cleaned['assets_mb']} MB\n")
     else:
-        rprint("[dim]Step 0: No previous outputs to archive[/dim]\n")
+        rprint("[dim]Step 0: Nothing to clean[/dim]\n")
 
     # ── Step 1: Discover ──
     if not skip_discover:
@@ -255,7 +296,7 @@ def main():
     parser = argparse.ArgumentParser(description="ClipForge — Full Pipeline")
     parser.add_argument("--profile", default="funny-streamers", help="Profile slug to process")
     parser.add_argument("--skip-discover", action="store_true", help="Skip discovery step")
-    parser.add_argument("--limit", type=int, default=50, help="Max clips per creator to discover")
+    parser.add_argument("--limit", type=int, default=10, help="Max clips per creator to discover (Twitch sorts by views)")
     parser.add_argument("--top", type=int, default=20, help="Only package the top N clips by viral score")
     args = parser.parse_args()
 

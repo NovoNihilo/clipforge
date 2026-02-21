@@ -84,7 +84,7 @@ async def discover_for_profile(profile_slug: str, max_per_creator: int | None = 
         newest_time = last_fetched
         for clip in clips:
             try:
-                db.execute("""
+                cursor = db.execute("""
                     INSERT OR IGNORE INTO clips
                     (platform, clip_id, creator_id, profile_id, status, metadata_json)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -96,9 +96,8 @@ async def discover_for_profile(profile_slug: str, max_per_creator: int | None = 
                     ClipStatus.DISCOVERED.value,
                     clip.to_json(),
                 ))
-                cursor = db.execute("INSERT OR IGNORE INTO clips ...")
                 if cursor.rowcount > 0:
-                    new_clips.append(...)({
+                    new_clips.append({
                         "clip_id": clip.clip_id,
                         "platform": clip.platform,
                         "title": clip.title,

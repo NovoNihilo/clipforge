@@ -295,6 +295,12 @@ async def decide_clip(clip_row_id: int) -> bool:
 
     llm_resp = await call_llm_api(system, user_msg)
 
+    # BUG 5 FIX: Retry once on failure before giving up
+    if not llm_resp:
+        log.info("  Retrying LLM call in 3s...")
+        await asyncio.sleep(3.0)
+        llm_resp = await call_llm_api(system, user_msg)
+
     if not llm_resp:
         db.execute("""
             UPDATE clips SET status = ?, fail_reason = 'llm_call_failed', updated_at = datetime('now')

@@ -138,12 +138,12 @@ async def discover_clips_for_creator(
 ) -> list[ClipMeta]:
     """
     Get new clips since last_fetched_at.
-    If no cursor, defaults to last 7 days.
+    If no cursor, defaults to last 24 hours.
     """
     if not last_fetched_at:
-        # Default: clips from last 7 days
-        week_ago = datetime.now(timezone.utc) - timedelta(days=1)
-        last_fetched_at = week_ago.isoformat()
+        # Default: clips from last 24 hours
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        last_fetched_at = cutoff.isoformat()
 
     all_clips: list[ClipMeta] = []
     cursor = None

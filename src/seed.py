@@ -32,6 +32,8 @@ PROFILE = {
         hook_max_delay_sec=2.0,
         silence_ratio_max=0.20,
         caption_style="bold_white",
+        caption_max_words=2,
+        max_clips_per_creator_per_run=10,
         hashtag_bank=[
             "#shorts", "#funny", "#streamer", "#viral",
             "#twitch", "#kick", "#livestream", "#clips",
@@ -90,12 +92,12 @@ async def seed_profile_and_creators():
     for platform, login, display_name in CREATORS:
         platform_user_id = login  # default: use login as ID
 
-        # For Twitch, resolve login → broadcaster_id
+        # For Twitch, resolve login -> broadcaster_id
         if platform == "twitch":
             bid = await get_broadcaster_id(login)
             if bid:
                 platform_user_id = bid
-                rprint(f"  Twitch {login} → broadcaster_id={bid}")
+                rprint(f"  Twitch {login} -> broadcaster_id={bid}")
             else:
                 rprint(f"  [yellow]⚠ Could not resolve Twitch user: {login} — skipping[/yellow]")
                 continue

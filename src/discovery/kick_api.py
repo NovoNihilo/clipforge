@@ -72,4 +72,7 @@ async def discover_clips_for_creator(
                 filtered.append(clip)
         all_clips = filtered
 
+    # Sort by views descending so we keep the top clips, not arbitrary order
+    all_clips.sort(key=lambda c: c.view_count, reverse=True)
+
     return all_clips[:max_clips]
